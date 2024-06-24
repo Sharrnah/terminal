@@ -218,6 +218,11 @@ func (t *Terminal) Text() string {
 	return t.content.Text()
 }
 
+// SetText sets the contents of the buffer as a single string joined with `\n` for linebreaks.
+func (t *Terminal) SetText(text string) {
+	t.content.SetText(text)
+}
+
 // ExitCode returns the exit code from the terminal's shell.
 // Returns -1 if called before shell was started or before shell exited.
 // Also returns -1 if shell was terminated by a signal.
