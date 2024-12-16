@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -77,13 +78,14 @@ type Terminal struct {
 		ctrlPressed  bool
 		altPressed   bool
 	}
-	newLineMode        bool // new line mode or line feed mode
-	bracketedPasteMode bool
-	state              *parseState
-	blinking           bool
-	printData          []byte
-	printer            Printer
-	cmd                *exec.Cmd
+	newLineMode            bool // new line mode or line feed mode
+	bracketedPasteMode     bool
+	state                  *parseState
+	blinking               bool
+	printData              []byte
+	printer                Printer
+	cmd                    *exec.Cmd
+	readWriterConfigurator ReadWriterConfigurator
 }
 
 // Printer is used for spooling print data when its received.
@@ -126,7 +128,11 @@ func (t *Terminal) MinSize() fyne.Size {
 // MouseDown handles the down action for desktop mouse events.
 func (t *Terminal) MouseDown(ev *desktop.MouseEvent) {
 	if t.hasSelectedText() {
+		t.copySelectedText(fyne.CurrentApp().Clipboard())
 		t.clearSelectedText()
+	}
+	if ev.Button == desktop.MouseButtonSecondary {
+		t.pasteText(fyne.CurrentApp().Clipboard())
 	}
 
 	if t.onMouseDown == nil {
@@ -142,9 +148,6 @@ func (t *Terminal) MouseDown(ev *desktop.MouseEvent) {
 
 // MouseUp handles the up action for desktop mouse events.
 func (t *Terminal) MouseUp(ev *desktop.MouseEvent) {
-	if ev.Button == desktop.MouseButtonSecondary && t.hasSelectedText() {
-		t.copySelectedText(fyne.CurrentApp().Driver().AllWindows()[0].Clipboard())
-	}
 
 	if t.onMouseDown == nil {
 		return
@@ -155,6 +158,51 @@ func (t *Terminal) MouseUp(ev *desktop.MouseEvent) {
 	} else if ev.Button == desktop.MouseButtonSecondary {
 		t.onMouseUp(2, ev.Modifier, ev.Position)
 	}
+}
+
+// DoubleTapped handles the double tapped event.
+func (t *Terminal) DoubleTapped(pe *fyne.PointEvent) {
+	pos := t.sanitizePosition(pe.Position)
+	termPos := t.getTermPosition(*pos)
+	row, col := termPos.Row, termPos.Col
+
+	if t.hasSelectedText() {
+		t.clearSelectedText()
+	}
+
+	if row < 1 || row > len(t.content.Rows) {
+		return
+	}
+
+	rowContent := t.content.Rows[row-1].Cells
+
+	if col < 0 || col >= len(rowContent) {
+		return // No valid character under the cursor, do nothing
+	}
+
+	start, end := col-1, col-1
+
+	if !unicode.IsLetter(rowContent[start].Rune) && !unicode.IsDigit(rowContent[start].Rune) {
+		return
+	}
+
+	for start > 0 && (unicode.IsLetter(rowContent[start-1].Rune) || unicode.IsDigit(rowContent[start-1].Rune)) {
+		start--
+	}
+	if start < len(rowContent) && !unicode.IsLetter(rowContent[start].Rune) && !unicode.IsDigit(rowContent[start].Rune) {
+		start++
+	}
+	for end < len(rowContent) && (unicode.IsLetter(rowContent[end].Rune) || unicode.IsDigit(rowContent[end].Rune)) {
+		end++
+	}
+	if start == end {
+		return
+	}
+
+	t.selStart = &position{Row: row, Col: start + 1}
+	t.selEnd = &position{Row: row, Col: end}
+
+	t.highlightSelectedText()
 }
 
 // RemoveListener de-registers a Config channel and closes it
@@ -271,8 +319,12 @@ func (t *Terminal) open() error {
 	if err != nil {
 		return err
 	}
-	t.in = in
-	t.out = out
+
+	t.in, t.out = in, out
+	if t.readWriterConfigurator != nil {
+		t.out, t.in = t.readWriterConfigurator.SetupReadWriter(out, in)
+	}
+
 	t.pty = pty
 
 	t.updatePTYSize()
@@ -358,8 +410,10 @@ func (t *Terminal) RunWithConnection(in io.WriteCloser, out io.Reader) error {
 	for t.config.Columns == 0 { // don't load the TTY until our output is configured
 		time.Sleep(time.Millisecond * 50)
 	}
-	t.in = in
-	t.out = out
+	t.in, t.out = in, out
+	if t.readWriterConfigurator != nil {
+		t.out, t.in = t.readWriterConfigurator.SetupReadWriter(out, in)
+	}
 
 	t.run()
 
@@ -385,22 +439,7 @@ func (t *Terminal) setupShortcuts() {
 	t.ShortcutHandler.AddShortcut(paste,
 		func(_ fyne.Shortcut) {
 			a := fyne.CurrentApp()
-			c := a.Driver().CanvasForObject(t)
-			if c == nil {
-				return
-			}
-
-			var win fyne.Window
-			for _, w := range a.Driver().AllWindows() {
-				if w.Canvas() == c {
-					win = w
-				}
-			}
-			if win == nil {
-				return
-			}
-
-			t.pasteText(win.Clipboard())
+			t.pasteText(a.Clipboard())
 		})
 	var shortcutCopy fyne.Shortcut
 	shortcutCopy = &desktop.CustomShortcut{KeyName: fyne.KeyC, Modifier: fyne.KeyModifierShift | fyne.KeyModifierShortcutDefault}
@@ -411,22 +450,7 @@ func (t *Terminal) setupShortcuts() {
 	t.ShortcutHandler.AddShortcut(shortcutCopy,
 		func(_ fyne.Shortcut) {
 			a := fyne.CurrentApp()
-			c := a.Driver().CanvasForObject(t)
-			if c == nil {
-				return
-			}
-
-			var win fyne.Window
-			for _, w := range a.Driver().AllWindows() {
-				if w.Canvas() == c {
-					win = w
-				}
-			}
-			if win == nil {
-				return
-			}
-
-			t.copySelectedText(win.Clipboard())
+			t.copySelectedText(a.Clipboard())
 		})
 }
 
@@ -446,6 +470,7 @@ func New() *Terminal {
 	t := &Terminal{
 		mouseCursor:      desktop.DefaultCursor,
 		highlightBitMask: 0x55,
+		in:               discardWriter{},
 	}
 	t.ExtendBaseWidget(t)
 	t.content = widget2.NewTermGrid()
@@ -501,4 +526,31 @@ func (t *Terminal) Dragged(d *fyne.DragEvent) {
 // DragEnd is called by fyne when the left mouse is released after a Drag event.
 func (t *Terminal) DragEnd() {
 	t.selecting = false
+}
+
+// SetReadWriter sets the readWriterConfigurator function that will be used when creating a new terminal.
+// The readWriterConfigurator function is responsible for setting up the I/O readers and writers.
+func (t *Terminal) SetReadWriter(mw ReadWriterConfigurator) {
+	t.readWriterConfigurator = mw
+}
+
+// ReadWriterConfigurator is an interface that defines the methods required to set up
+// the input (reader) and output (writer) streams for the terminal.
+// Implementations of this interface can modify or wrap the reader and writer.
+type ReadWriterConfigurator interface {
+	// SetupReadWriter configures the input and output streams for the terminal.
+	// It takes an input reader (r) and an output writer (w) as arguments.
+	// The function returns a possibly modified reader and writer that
+	// the terminal will use for I/O operations.
+	SetupReadWriter(r io.Reader, w io.WriteCloser) (io.Reader, io.WriteCloser)
+}
+
+// ReadWriterConfiguratorFunc is a function type that matches the signature of the
+// SetupReadWriter method in the Middleware interface.
+type ReadWriterConfiguratorFunc func(r io.Reader, w io.WriteCloser) (io.Reader, io.WriteCloser)
+
+// SetupReadWriter allows ReadWriterConfiguratorFunc to satisfy the Middleware interface.
+// It calls the ReadWriterConfiguratorFunc itself.
+func (m ReadWriterConfiguratorFunc) SetupReadWriter(r io.Reader, w io.WriteCloser) (io.Reader, io.WriteCloser) {
+	return m(r, w)
 }
